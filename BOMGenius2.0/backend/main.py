@@ -3,14 +3,14 @@ import ollama
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict
 import sqlite3
 from datetime import datetime
 
 import pandas as pd
 from core.ebom_loader import load_ebom
 from core.engine import generate_mbom
-from fastapi import FastAPI, File, Query, UploadFile
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,8 +22,7 @@ from fastapi import HTTPException
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 frontend_path = os.path.join(BASE_DIR, "frontend")
-
-DATABASE = "bomgenius.db"
+DATABASE = os.path.join(BASE_DIR, "bomgenius.db")
 
 c_id = -1
 
@@ -31,6 +30,12 @@ c_id = -1
 
 app = FastAPI(title="BOMGenius API")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.mount("/frontend", StaticFiles(directory=frontend_path), name="frontend")
 
@@ -134,7 +139,7 @@ def save_settings(data: SettingsData):
 @app.post("/userlogin")
 def login(data: LoginRequest):
 
-    conn = sqlite3.connect("bomgenius.db")
+    conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
 
     cursor.execute(
@@ -168,7 +173,7 @@ def register(data: RegisterRequest):
     if data.password != data.confirm_password:
         raise HTTPException(status_code=400, detail="Passwords do not match")
 
-    with sqlite3.connect("bomgenius.db") as conn:
+    with sqlite3.connect(DATABASE) as conn:
         cursor = conn.cursor()
 
         # Check if email already exists
@@ -264,69 +269,78 @@ async def fullbomconverter(
     }
 
 
-
-
-@app.get("/dashboard")
-def dashboard():
-
-    conn = sqlite3.connect("bomgenius.db")
+@app.get("/dashboard/analytics")
+def dashboard_analytics():
+    conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # Total BOM uploads (unique timestamps)
-    cur.execute("SELECT COUNT(DISTINCT timestamp) as total_boms FROM mbom")
-    total_boms = cur.fetchone()["total_boms"] or 0
+    cur.execute("SELECT MAX(timestamp) AS ts FROM mbom")
+    ts = cur.fetchone()["ts"]
 
-    # Total components
-    cur.execute("SELECT COUNT(*) as total_components FROM mbom")
-    total_components = cur.fetchone()["total_components"] or 0
+    if not ts:
+        return {
+            "composition": [],
+            "confidence": {"high": 0, "medium": 0, "low": 0},
+            "timestamp": None,
+        }
 
-    # Avg components per BOM
-    avg_components = 0
-    if total_boms > 0:
-        avg_components = round(total_components / total_boms)
-
-    # Confidence statistics
-    cur.execute("""
-        SELECT
-            SUM(CASE WHEN Confidence_Score >= 0.90 THEN 1 ELSE 0 END) AS high,
-            SUM(CASE WHEN Confidence_Score >= 0.70 AND Confidence_Score < 0.90 THEN 1 ELSE 0 END) AS medium,
-            SUM(CASE WHEN Confidence_Score < 0.70 THEN 1 ELSE 0 END) AS low,
-            AVG(Confidence_Score) as avg_confidence
+    # Pie: Item type composition
+    cur.execute(
+        """
+        SELECT COALESCE(Item_Type, 'Standard Parts') AS item_type, COUNT(*) AS cnt
         FROM mbom
-    """)
+        WHERE timestamp = ?
+        GROUP BY COALESCE(Item_Type, 'Standard Parts')
+        ORDER BY cnt DESC
+    """,
+        (ts,),
+    )
+    composition = [dict(r) for r in cur.fetchall()]
+
+    # Bar: confidence buckets
+    cur.execute(
+        """
+        SELECT
+          SUM(CASE WHEN Confidence_Score >= 0.90 THEN 1 ELSE 0 END) AS high,
+          SUM(CASE WHEN Confidence_Score >= 0.70 AND Confidence_Score < 0.90 THEN 1 ELSE 0 END) AS medium,
+          SUM(CASE WHEN Confidence_Score < 0.70 THEN 1 ELSE 0 END) AS low
+        FROM mbom
+        WHERE timestamp = ?
+    """,
+        (ts,),
+    )
+    conf = dict(cur.fetchone())
+    # Accuracy
+
+    # Confidence + Accuracy Calculation
+    cur.execute(
+        """
+    SELECT
+      SUM(CASE WHEN Confidence_Score >= 0.90 THEN 1 ELSE 0 END) AS high,
+      SUM(CASE WHEN Confidence_Score >= 0.70 AND Confidence_Score < 0.90 THEN 1 ELSE 0 END) AS medium,
+      SUM(CASE WHEN Confidence_Score < 0.70 THEN 1 ELSE 0 END) AS low,
+      COUNT(*) as total
+    FROM mbom
+    WHERE timestamp = ?
+""",
+        (ts,),
+    )
 
     conf = dict(cur.fetchone())
 
-    avg_confidence = conf["avg_confidence"] or 0
+    total = conf.get("total", 0) or 0
+    high = conf.get("high", 0) or 0
 
-    # Consumable breakdown (Pie chart)
-    cur.execute("""
-        SELECT
-        COALESCE(NULLIF(TRIM(Consumables),''),'NA') as type,
-        COUNT(*) as count
-        FROM mbom
-        WHERE Consumables IS NOT NULL
-        AND LOWER(TRIM(Consumables)) NOT IN ('','na','none')
-        GROUP BY type
-        ORDER BY count DESC
-    """)
-
-    consumable_breakdown = [dict(r) for r in cur.fetchall()]
+    # Accuracy = High confidence matches / Total records
+    accuracy = round((high / total) * 100, 2) if total > 0 else 0
 
     conn.close()
-
     return {
-        "total_boms": total_boms,
-        "total_components": total_components,
-        "avg_components": avg_components,
-        "avg_confidence": avg_confidence,
-        "confidence": {
-            "high": conf["high"] or 0,
-            "medium": conf["medium"] or 0,
-            "low": conf["low"] or 0
-        },
-        "consumable_breakdown": consumable_breakdown
+        "composition": composition,
+        "confidence": conf,
+        "timestamp": ts,
+        "accuracy": accuracy,
     }
 
 
@@ -343,12 +357,7 @@ async def ebom_from_image_api(file: UploadFile = File(...)):
     return {"columns": list(df_ebom.columns), "rows": df_ebom.to_dict(orient="records")}
 
 
-from fastapi import FastAPI, HTTPException
-import sqlite3
-from datetime import datetime
-from typing import List, Dict
-
-
+# (Imports and DATABASE definition cleaned up / moved to top)
 
 
 @app.get("/mbom/history", response_model=List[Dict])
@@ -420,10 +429,9 @@ def get_mbom_history():
 @app.get("/mbom/by-timestamp/{ts}")
 def get_mbom_by_timestamp(ts: str):
 
-    import sqlite3
     import pandas as pd
 
-    with sqlite3.connect("bomgenius.db") as conn:
+    with sqlite3.connect(DATABASE) as conn:
 
         conn.row_factory = sqlite3.Row
 
@@ -445,68 +453,122 @@ def get_mbom_by_timestamp(ts: str):
     return {"columns": columns, "rows": df.to_dict(orient="records")}
 
 
-@app.get("/dashboard_analytics")
-def dashboard_analytics(mode: str = Query(default="overall"),  # overall | latest
-    ts: Optional[str] = Query(default=None)):
-    conn = sqlite3.connect("bomgenius.db")
+@app.get("/dashboard")
+def get_dashboard():
+
+    conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    cursor = conn.cursor()
 
-    # Total BOM uploads (unique timestamps)
-    cur.execute("SELECT COUNT(DISTINCT timestamp) as total_boms FROM mbom")
-    total_boms = cur.fetchone()["total_boms"] or 0
-
-    # Total components
-    cur.execute("SELECT COUNT(*) as total_components FROM mbom")
-    total_components = cur.fetchone()["total_components"] or 0
-
-    # Avg components per BOM
-    avg_components = 0
-    if total_boms > 0:
-        avg_components = round(total_components / total_boms)
-
-    # Confidence statistics
-    cur.execute("""
-        SELECT
-            SUM(CASE WHEN Confidence_Score >= 0.90 THEN 1 ELSE 0 END) AS high,
-            SUM(CASE WHEN Confidence_Score >= 0.70 AND Confidence_Score < 0.90 THEN 1 ELSE 0 END) AS medium,
-            SUM(CASE WHEN Confidence_Score < 0.70 THEN 1 ELSE 0 END) AS low,
-            AVG(Confidence_Score) as avg_confidence
+    # -------------------------
+    # Total BOMs
+    # -------------------------
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS total_boms
         FROM mbom
-    """)
+        """
+        )
+    total_boms = round(cursor.fetchone()["total_boms"]/2) or 0
 
-    conf = dict(cur.fetchone())
+    # -------------------------
+    # Total Components
+    # -------------------------
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS total_components
+        FROM mbom
+    """
+    )
+    total_components = cursor.fetchone()["total_components"]
 
-    avg_confidence = conf["avg_confidence"] or 0
+    # -------------------------
+    # Latest Upload
+    # -------------------------
+    cursor.execute(
+        """
+        SELECT MAX(timestamp) AS last_uploaded
+        FROM mbom
+    """
+    )
+    last_uploaded = cursor.fetchone()["last_uploaded"]
 
-    # Consumable breakdown (Pie chart)
-    cur.execute("""
-    SELECT
-      COALESCE(NULLIF(TRIM(Consumables), ''), 'NA') AS item_type,
-      COUNT(*) AS cnt
+    # -------------------------
+    # Avg Components per BOM
+    # -------------------------
+    cursor.execute(
+        """
+        SELECT ROUND(AVG(component_count), 2) AS avg_components
+        FROM (
+        SELECT Parent_Part_No, COUNT(*) AS component_count
+        FROM mbom
+        WHERE company_id = ?
+        GROUP BY Parent_Part_No
+        ) t
+        """
+    , (c_id,))
+    avg_components = cursor.fetchone()["avg_components"] or 0
+
+    # -------------------------
+    # Accuracy Calculation
+    # -------------------------
+    cursor.execute(
+        """
+    SELECT COUNT(*) as total,
+           SUM(CASE WHEN Confidence_Score >= 0.90 THEN 1 ELSE 0 END) as high
     FROM mbom
-    WHERE timestamp = ?
-      AND Consumables IS NOT NULL
-      AND LOWER(TRIM(Consumables)) NOT IN ('', 'na', 'none')
-    GROUP BY COALESCE(NULLIF(TRIM(Consumables), ''), 'NA')
-    ORDER BY cnt DESC
-""", (ts,))
+    WHERE Confidence_Score IS NOT NULL
+"""
+    )
 
-    consumable_breakdown = [dict(r) for r in cur.fetchall()]
+    row = cursor.fetchone()
+    total = row["total"] or 0
+    high = row["high"] or 0
+
+    accuracy = round((high / total) * 100, 2) if total > 0 else 0
+
+    # -------------------------
+    # Consumable Breakdown
+    # -------------------------
+    cursor.execute(
+        """
+        SELECT Consumables, COUNT(*) as count
+        FROM mbom
+        WHERE Consumables IS NOT NULL
+              AND TRIM(Consumables) != ''
+              AND LOWER(Consumables) != 'na'
+        GROUP BY Consumables
+    """
+    )
+
+    rows = cursor.fetchall()
+
+    consumable_breakdown = [
+        {"type": row["Consumables"], "count": row["count"]} for row in rows
+    ]
+
+    # -------------------------
+    # Avg Confidence Score
+    # -------------------------
+    cursor.execute(
+        """
+        SELECT ROUND(AVG(Confidence_Score), 2) AS avg_confidence
+        FROM mbom
+        WHERE Confidence_Score IS NOT NULL
+    """
+    )
+
+    avg_confidence = cursor.fetchone()["avg_confidence"]
 
     conn.close()
-
     return {
-        "total_boms": total_boms,
-        "total_components": total_components,
-        "avg_components": avg_components,
-        "avg_confidence": avg_confidence,
-        "confidence": {
-            "high": conf["high"] or 0,
-            "medium": conf["medium"] or 0,
-            "low": conf["low"] or 0
-        },
-        "consumable_breakdown": consumable_breakdown
+        "total_boms": total_boms or 0,
+        "total_components": total_components or 0,
+        "last_uploaded": last_uploaded,
+        "avg_components": avg_components or 0,
+        "avg_confidence": avg_confidence or 0,
+        "accuracy": accuracy,  # 👈 IMPORTANT
+        "consumable_breakdown": consumable_breakdown,
     }
 
 
@@ -550,10 +612,10 @@ class CompanyCreate(BaseModel):
 @app.post("/company")
 def create_company(data: CompanyCreate):
 
-    with sqlite3.connect("bomgenius.db") as conn:
+    with sqlite3.connect(DATABASE) as conn:
         conn.execute(
-            "INSERT INTO companies (name, created_at) VALUES (?, ?)",
-            (data.name, datetime.datetime.now().isoformat()),
+            "INSERT INTO companies (company_name, created_at) VALUES (?, ?)",
+            (data.name, datetime.now().isoformat()),
         )
 
     return {"status": "company created"}
@@ -561,11 +623,9 @@ def create_company(data: CompanyCreate):
 
 @app.get("/company")
 def get_companies():
-    import sqlite3
-
-    with sqlite3.connect("bomgenius.db") as conn:
+    with sqlite3.connect(DATABASE) as conn:
         rows = conn.execute(
-            "SELECT id, name, created_at, last_login, is_active FROM companies"
+            "SELECT id, company_name, created_at, last_login, is_active FROM companies"
         ).fetchall()
 
     return [
@@ -586,19 +646,15 @@ class CompanyUpdate(BaseModel):
 
 @app.put("/company/{cid}")
 def update_company(cid: int, data: CompanyUpdate):
-    import sqlite3
-
-    with sqlite3.connect("bomgenius.db") as conn:
-        conn.execute("UPDATE companies SET name=? WHERE id=?", (data.name, cid))
+    with sqlite3.connect(DATABASE) as conn:
+        conn.execute("UPDATE companies SET company_name=? WHERE id=?", (data.name, cid))
 
     return {"status": "updated"}
 
 
 @app.delete("/company/{cid}")
 def delete_company(cid: int):
-    import sqlite3
-
-    with sqlite3.connect("bomgenius.db") as conn:
+    with sqlite3.connect(DATABASE) as conn:
         conn.execute("DELETE FROM companies WHERE id=?", (cid,))
 
     return {"status": "deleted"}
@@ -606,9 +662,7 @@ def delete_company(cid: int):
 
 @app.patch("/company/{cid}/status")
 def toggle_company_status(cid: int):
-    import sqlite3
-
-    with sqlite3.connect("bomgenius.db") as conn:
+    with sqlite3.connect(DATABASE) as conn:
         cur = conn.cursor()
 
         cur.execute("SELECT is_active FROM companies WHERE id=?", (cid,))

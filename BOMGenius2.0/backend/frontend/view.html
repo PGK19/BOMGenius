@@ -26,6 +26,8 @@ async function loadMBOM() {
   );
 
   const data = await response.json();
+  console.log("COLUMNS:", data.columns);
+  console.log("ROWS:", data.rows);
 
   const thead = document.querySelector("#mbomTable thead");
   const tbody = document.querySelector("#mbomTable tbody");
@@ -43,7 +45,7 @@ async function loadMBOM() {
     const tr = document.createElement("tr");
 
     tr.innerHTML = data.columns.map(col =>
-      `<td class="p-3 border">${row[col]}</td>`
+      `<td class="p-3 border">${row[col] ?? ""}</td>`
     ).join("");
 
     tbody.appendChild(tr);

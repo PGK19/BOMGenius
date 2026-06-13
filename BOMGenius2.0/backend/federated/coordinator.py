@@ -12,24 +12,32 @@ def aggregate():
     all_updates = []
 
     for node in FACTORY_NODES:
-        r = requests.get(f"{node}/federated/export")
-        all_updates.append(r.json())
+        try:
+            r = requests.get(f"{node}/federated/export")
+            if r.status_code == 200:
+                all_updates.append(r.json())
+        except Exception as e:
+            print(f"Error exporting from {node}: {e}")
 
-    make_buy_votes = {}
+    part_votes = {}
 
     for node_updates in all_updates:
-        for u in node_updates:
-            pn = u["part_no"]
-            make_buy_votes.setdefault(pn, []).append(u.get("correct_make_buy"))
+        if isinstance(node_updates, dict):
+            for ebom_part, correct_part in node_updates.items():
+                part_votes.setdefault(ebom_part, []).append(correct_part)
 
     global_rules = {}
-    for pn, votes in make_buy_votes.items():
-        global_rules[pn] = {"Make_Buy": Counter(votes).most_common(1)[0][0]}
+    for ebom_part, votes in part_votes.items():
+        if votes:
+            global_rules[ebom_part] = Counter(votes).most_common(1)[0][0]
 
     print("Aggregated Rules:", global_rules)
 
     for node in FACTORY_NODES:
-        requests.post(f"{node}/federated/import", json=global_rules)
+        try:
+            requests.post(f"{node}/federated/import", json=global_rules)
+        except Exception as e:
+            print(f"Error importing to {node}: {e}")
 
 
 if __name__ == "__main__":

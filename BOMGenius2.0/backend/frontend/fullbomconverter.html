@@ -365,7 +365,8 @@ function downloadXML() {
     if (i === 0) return;
     xml += "<Row>";
     row.querySelectorAll("td").forEach((cell, idx) => {
-      xml += `<${headers[idx]}>${cell.innerText}</${headers[idx]}>`;
+      const tagName = headers[idx].replace(/\s+/g, "_").replace(/[^a-zA-Z0-9_]/g, "");
+      xml += `<${tagName}>${cell.innerText}</${tagName}>`;
     });
     xml += "</Row>";
   });

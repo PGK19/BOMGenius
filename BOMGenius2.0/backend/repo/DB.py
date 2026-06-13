@@ -23,9 +23,19 @@ def init_db():
             company_name TEXT,
             email TEXT UNIQUE,
             password TEXT,
-            created_at TEXT
+            created_at TEXT,
+            last_login TEXT,
+            is_active INTEGER DEFAULT 1
         )
     """)
+
+    # Ensure missing columns exist in case the table was created before
+    cursor.execute("PRAGMA table_info(companies)")
+    existing_columns = [col[1] for col in cursor.fetchall()]
+    if "last_login" not in existing_columns:
+        cursor.execute("ALTER TABLE companies ADD COLUMN last_login TEXT")
+    if "is_active" not in existing_columns:
+        cursor.execute("ALTER TABLE companies ADD COLUMN is_active INTEGER DEFAULT 1")
 
     # ---- MBOM Table ----
     cursor.execute("""
